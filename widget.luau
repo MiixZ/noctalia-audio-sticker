@@ -41,6 +41,7 @@ end
 
 local function gifCacheDir(path)
   local safe = path:gsub("[^a-zA-Z0-9_.-]", "_")
+  safe = safe:gsub("%.gif$", "") -- avoid a directory name ending in .gif
   return dataDir .. "/gif-cache/" .. safe
 end
 
@@ -61,18 +62,22 @@ local function parseGifDurations(stdout)
 end
 
 local function parseFfmpegDurations(stdout)
+  -- ffprobe outputs absolute PTS per frame in seconds.
+  -- Convert those into per-frame durations by differencing consecutive PTS values.
   local durations = {}
   local total = 0
+  local lastMs = 0
   for line in stdout:gmatch("[^\r\n]+") do
-    -- ffmpeg pts output is in seconds, e.g. "0.033333"
     local sec = tonumber(line)
     if sec then
       local ms = math.floor(sec * 1000)
-      if ms <= 0 then
-        ms = 33
+      local dur = ms - lastMs
+      lastMs = ms
+      if dur <= 0 then
+        dur = 33
       end
-      table.insert(durations, ms)
-      total = total + ms
+      table.insert(durations, dur)
+      total = total + dur
     end
   end
   return durations, total
@@ -110,10 +115,10 @@ local function loadGifMetadata(cacheDir)
   return true
 end
 
-local function finalizeFrames(cacheDir, frameCount, durations, totalDuration, extractor)
+local function finalizeFrames(cacheDir, frameCount, startIndex, durations, totalDuration, extractor)
   local frames = {}
   for i = 0, frameCount - 1 do
-    table.insert(frames, string.format("frame-%03d.png", i))
+    table.insert(frames, string.format("frame-%03d.png", startIndex + i))
   end
   saveGifMetadata(cacheDir, frames, durations, totalDuration, extractor)
 
@@ -123,92 +128,8 @@ local function finalizeFrames(cacheDir, frameCount, durations, totalDuration, ex
   end
   gifDurations = durations
   gifTotalDuration = totalDuration
-  gifPath = gifPath or ""  -- will be set by caller
   gifStartTime = noctalia.nowMs()
   gifLoading = false
-end
-
-local function extractWithFfmpeg(path, cacheDir)
-  -- ffmpeg starts output at frame-001.png; probe duration first.
-  noctalia.runAsync({
-    "ffprobe", "-v", "error", "-select_streams", "v:0",
-    "-show_entries", "frame=pts_time", "-of",
-    "csv=p=0", path
-  }, function(probe)
-    if probe.exitCode ~= 0 then
-      noctalia.log("ffprobe failed: " .. (probe.stderr or ""))
-      -- Fallback to magick.
-      extractWithMagick(path, cacheDir)
-      return
-    end
-
-    local durations, totalDuration = parseFfmpegDurations(probe.stdout)
-    local frameCount = #durations
-    if frameCount == 0 then
-      durations = { 100 }
-      totalDuration = 100
-      frameCount = 1
-    end
-
-    -- Check cache.
-    local cached = true
-    for i = 1, frameCount do
-      -- ffmpeg names frames 1-based.
-      local framePath = string.format(cacheDir .. "/frame-%03d.png", i)
-      if not noctalia.fileExists(framePath) then
-        cached = false
-        break
-      end
-    end
-
-    if cached then
-      -- Convert 1-based ffmpeg names to 0-based internal names.
-      local frames = {}
-      for i = 1, frameCount do
-        table.insert(frames, string.format("frame-%03d.png", i))
-      end
-      saveGifMetadata(cacheDir, frames, durations, totalDuration, "ffmpeg")
-      gifFrames = {}
-      for _, name in ipairs(frames) do
-        table.insert(gifFrames, cacheDir .. "/" .. name)
-      end
-      gifDurations = durations
-      gifTotalDuration = totalDuration
-      gifPath = path
-      gifStartTime = noctalia.nowMs()
-      gifLoading = false
-      return
-    end
-
-    -- Extract resized frames with ffmpeg (much faster than ImageMagick).
-    noctalia.runAsync({
-      "ffmpeg", "-y", "-i", path,
-      "-vf", "scale=320:-1:flags=lanczos",
-      "-pix_fmt", "rgba",
-      cacheDir .. "/frame-%03d.png"
-    }, function(result)
-      if result.exitCode ~= 0 then
-        noctalia.log("ffmpeg extraction failed: " .. (result.stderr or ""))
-        extractWithMagick(path, cacheDir)
-        return
-      end
-
-      local frames = {}
-      for i = 1, frameCount do
-        table.insert(frames, string.format("frame-%03d.png", i))
-      end
-      saveGifMetadata(cacheDir, frames, durations, totalDuration, "ffmpeg")
-      gifFrames = {}
-      for _, name in ipairs(frames) do
-        table.insert(gifFrames, cacheDir .. "/" .. name)
-      end
-      gifDurations = durations
-      gifTotalDuration = totalDuration
-      gifPath = path
-      gifStartTime = noctalia.nowMs()
-      gifLoading = false
-    end)
-  end)
 end
 
 local function extractWithMagick(path, cacheDir)
@@ -241,8 +162,7 @@ local function extractWithMagick(path, cacheDir)
     end
 
     if cached then
-      finalizeFrames(cacheDir, frameCount, durations, totalDuration, "magick")
-      gifPath = path
+      finalizeFrames(cacheDir, frameCount, 0, durations, totalDuration, "magick")
       return
     end
 
@@ -255,8 +175,60 @@ local function extractWithMagick(path, cacheDir)
         gifLoading = false
         return
       end
-      finalizeFrames(cacheDir, frameCount, durations, totalDuration, "magick")
-      gifPath = path
+      finalizeFrames(cacheDir, frameCount, 0, durations, totalDuration, "magick")
+    end)
+  end)
+end
+
+local function extractWithFfmpeg(path, cacheDir)
+  -- ffmpeg starts output at frame-001.png; probe duration first.
+  noctalia.runAsync({
+    "ffprobe", "-v", "error", "-select_streams", "v:0",
+    "-show_entries", "frame=pts_time", "-of",
+    "csv=p=0", path
+  }, function(probe)
+    if probe.exitCode ~= 0 then
+      noctalia.log("ffprobe failed: " .. (probe.stderr or ""))
+      extractWithMagick(path, cacheDir)
+      return
+    end
+
+    local durations, totalDuration = parseFfmpegDurations(probe.stdout)
+    local frameCount = #durations
+    if frameCount == 0 then
+      durations = { 100 }
+      totalDuration = 100
+      frameCount = 1
+    end
+
+    -- ffmpeg names frames 1-based.
+    local cached = true
+    for i = 1, frameCount do
+      local framePath = string.format(cacheDir .. "/frame-%03d.png", i)
+      if not noctalia.fileExists(framePath) then
+        cached = false
+        break
+      end
+    end
+
+    if cached then
+      finalizeFrames(cacheDir, frameCount, 1, durations, totalDuration, "ffmpeg")
+      return
+    end
+
+    -- Extract resized frames with ffmpeg (much faster than ImageMagick).
+    noctalia.runAsync({
+      "ffmpeg", "-y", "-i", path,
+      "-vf", "scale=320:-1:flags=lanczos",
+      "-pix_fmt", "rgba",
+      cacheDir .. "/frame-%03d.png"
+    }, function(result)
+      if result.exitCode ~= 0 then
+        noctalia.log("ffmpeg extraction failed: " .. (result.stderr or ""))
+        extractWithMagick(path, cacheDir)
+        return
+      end
+      finalizeFrames(cacheDir, frameCount, 1, durations, totalDuration, "ffmpeg")
     end)
   end)
 end
@@ -329,7 +301,7 @@ local function renderImage(path)
           width = 320,
           height = 320,
           opacity = opacity,
-          fit = "cover",
+          fit = "contain",
         })
       )
       return
@@ -350,7 +322,7 @@ local function renderImage(path)
       width = 320,
       height = 320,
       opacity = opacity,
-      fit = "cover",
+      fit = "contain",
     })
   )
 end
