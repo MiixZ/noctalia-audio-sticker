@@ -256,22 +256,6 @@ local function extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
   end)
 end
 
-local function detectTransparency(path, callback)
-  if not noctalia.commandExists("magick") then
-    callback(false)
-    return
-  end
-  noctalia.runAsync({
-    "magick", "identify", "-format", "%[opaque]\n", path
-  }, function(result)
-    if result.exitCode ~= 0 then
-      callback(true)
-      return
-    end
-    callback(trim(result.stdout) ~= "True")
-  end)
-end
-
 local function extractGifFrames(path)
   if gifLoading then
     -- If loading has been stuck for too long, allow a retry.
@@ -299,20 +283,17 @@ local function extractGifFrames(path)
     return
   end
 
-  -- ffmpeg is fast but loses transparent backgrounds on many GIFs.
-  -- Use ImageMagick for transparent GIFs so the alpha channel is preserved.
-  detectTransparency(path, function(isTransparent)
-    if isTransparent and noctalia.commandExists("magick") then
-      extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
-    elseif noctalia.commandExists("ffmpeg") then
-      extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
-    elseif noctalia.commandExists("magick") then
-      extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
-    else
-      noctalia.log("ffmpeg or ImageMagick is required for GIF support")
-      gifLoading = false
-    end
-  end)
+  -- ffmpeg is much faster than ImageMagick and preserves transparency on
+  -- correctly-authored transparent GIFs. Fall back to ImageMagick only if
+  -- ffmpeg is unavailable.
+  if noctalia.commandExists("ffmpeg") then
+    extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
+  elseif noctalia.commandExists("magick") then
+    extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
+  else
+    noctalia.log("ffmpeg or ImageMagick is required for GIF support")
+    gifLoading = false
+  end
 end
 
 local function currentGifFrame()
