@@ -376,10 +376,8 @@ local function setActive(active)
   targetOpacity = active
     and (noctalia.getConfig("active_opacity") or 1.0)
     or  (noctalia.getConfig("idle_opacity") or 0.0)
-
-  if active and gifPath then
-    gifStartTime = noctalia.nowMs()
-  end
+  -- Do NOT reset gifStartTime here; setActive is called on every config
+  -- update and would restart the GIF loop prematurely while audio is active.
 end
 
 local function startMonitor()
@@ -409,6 +407,10 @@ function update()
 
   local active = readState()
   setActive(active == true)
+  -- Initialise the animation start time only once on first load while audio is active.
+  if active and gifPath and gifStartTime == 0 then
+    gifStartTime = noctalia.nowMs()
+  end
   currentOpacity = targetOpacity
   opacity = targetOpacity
   previousState = active
@@ -428,6 +430,10 @@ function onFrameTick(deltaMs)
   if active ~= nil and active ~= previousState then
     previousState = active
     setActive(active)
+    -- Restart the GIF loop only when transitioning from idle to active.
+    if active and gifPath then
+      gifStartTime = noctalia.nowMs()
+    end
   end
 
   local fadeMs = noctalia.getConfig("fade_ms") or 300
