@@ -1,0 +1,9 @@
+# Build artifacts
+audio-monitor/noctalia-audio-monitor
+bin/noctalia-audio-monitor
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
