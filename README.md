@@ -8,12 +8,14 @@ A Noctalia desktop widget that shows a sticker image and fades it in/out based o
 - Detects when any output stream is actually running (not just open).
 - Fades the sticker to `active_opacity` when audio is playing.
 - Fades the sticker to `idle_opacity` after all audio has stopped for the hysteresis window.
+- Supports static images (PNG, JPEG, WebP, SVG) and **animated GIFs**.
 
 ## Requirements
 
 - Noctalia shell (plugin API 32 or later)
 - PipeWire with the default sink metadata (`pipewire` + `wireplumber`)
 - `gcc`, `make`, `pkg-config`, `libpipewire-0.3` headers
+- `magick` (ImageMagick) if you want animated GIF support
 
 ## Build
 
