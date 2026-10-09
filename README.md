@@ -96,7 +96,6 @@ You can also run the monitor directly to debug:
 
 ## Limitations
 
-- **Desktop only.** Noctalia does not allow plugins to add lockscreen widgets, so this cannot be used on the lock screen.
 - The C helper must be built for the target machine; the plugin will show an error if `bin/noctalia-audio-monitor` is missing.
 
 ## License
