@@ -83,6 +83,8 @@ local function parseFfmpegDurations(stdout)
   return durations, total
 end
 
+local CACHE_VERSION = 1
+
 local function saveGifMetadata(cacheDir, frames, durations, totalDuration, extractor, sourceMtime, sourceSize)
   local meta = {
     frames = frames,
@@ -91,6 +93,7 @@ local function saveGifMetadata(cacheDir, frames, durations, totalDuration, extra
     extractor = extractor or "unknown",
     sourceMtime = sourceMtime,
     sourceSize = sourceSize,
+    cacheVersion = CACHE_VERSION,
   }
   local ok, encoded = pcall(noctalia.json.encode, meta)
   if ok then
@@ -108,8 +111,12 @@ local function loadGifMetadata(cacheDir, path)
     return false
   end
 
-  -- Invalidate cache if the source file has changed.
+  -- Invalidate cache if the source file has changed, or if the cache format
+  -- has been updated (e.g. to fix transparency handling).
   -- Also invalidate legacy caches that lack source metadata.
+  if meta.cacheVersion ~= CACHE_VERSION then
+    return false
+  end
   if path then
     if meta.sourceMtime == nil or meta.sourceSize == nil then
       return false
@@ -249,6 +256,22 @@ local function extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
   end)
 end
 
+local function detectTransparency(path, callback)
+  if not noctalia.commandExists("magick") then
+    callback(false)
+    return
+  end
+  noctalia.runAsync({
+    "magick", "identify", "-format", "%[opaque]\n", path
+  }, function(result)
+    if result.exitCode ~= 0 then
+      callback(true)
+      return
+    end
+    callback(trim(result.stdout) ~= "True")
+  end)
+end
+
 local function extractGifFrames(path)
   if gifLoading then
     -- If loading has been stuck for too long, allow a retry.
@@ -276,14 +299,20 @@ local function extractGifFrames(path)
     return
   end
 
-  if noctalia.commandExists("ffmpeg") then
-    extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
-  elseif noctalia.commandExists("magick") then
-    extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
-  else
-    noctalia.log("ffmpeg or ImageMagick is required for GIF support")
-    gifLoading = false
-  end
+  -- ffmpeg is fast but loses transparent backgrounds on many GIFs.
+  -- Use ImageMagick for transparent GIFs so the alpha channel is preserved.
+  detectTransparency(path, function(isTransparent)
+    if isTransparent and noctalia.commandExists("magick") then
+      extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
+    elseif noctalia.commandExists("ffmpeg") then
+      extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
+    elseif noctalia.commandExists("magick") then
+      extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
+    else
+      noctalia.log("ffmpeg or ImageMagick is required for GIF support")
+      gifLoading = false
+    end
+  end)
 end
 
 local function currentGifFrame()
