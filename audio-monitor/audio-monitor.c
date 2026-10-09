@@ -7,7 +7,7 @@
  *   "active" when the level exceeds the threshold
  *   "idle"   when the level stays below the threshold for the hysteresis window
  *
- * Usage: noctalia-audio-monitor [--threshold T] [--hysteresis-ms N] [--debug]
+ * Usage: noctalia-audio-monitor [--threshold T] [--hysteresis-ms N] [--state-file PATH] [--debug]
  */
 
 #include <pipewire/pipewire.h>
@@ -25,12 +25,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 
 #define DEFAULT_THRESHOLD    0.001f
 #define DEFAULT_HYSTERESIS_MS 500
 #define DEFAULT_SAMPLE_RATE  48000
 #define NSEC_PER_SEC         1000000000ULL
 #define NSEC_PER_MSEC        1000000ULL
+
+static char *g_pid_file = NULL;
 
 struct context {
     struct pw_main_loop *loop;
@@ -52,6 +57,8 @@ struct context {
     float threshold;
     int hysteresis_ms;
     bool debug;
+    char *state_file;
+    FILE *state_fp;
 
     bool reported_active;
     float smoothed_level;
@@ -62,12 +69,26 @@ static struct context g_ctx;
 
 /* ---------- helpers ---------- */
 
-static void report_state(struct context *ctx, bool active)
+static void report_state(struct context *ctx, bool active, bool force)
 {
-    if (active == ctx->reported_active)
+    if (!force && active == ctx->reported_active)
         return;
 
-    printf("%s\n", active ? "active" : "idle");
+    const char *line = active ? "active" : "idle";
+
+    if (ctx->state_fp) {
+        /* Overwrite the file with the latest state. */
+        rewind(ctx->state_fp);
+        ftruncate(fileno(ctx->state_fp), 0);
+        fprintf(ctx->state_fp, "%s\n", line);
+        fflush(ctx->state_fp);
+        if (ctx->debug)
+            fprintf(stderr, "[audio-monitor] wrote state to file: %s\n", line);
+    } else if (ctx->debug) {
+        fprintf(stderr, "[audio-monitor] no state file, printing to stdout\n");
+    }
+
+    printf("%s\n", line);
     fflush(stdout);
     ctx->reported_active = active;
 }
@@ -76,6 +97,65 @@ static void nsec_to_timespec(uint64_t nsec, struct timespec *ts)
 {
     ts->tv_sec = (time_t)(nsec / NSEC_PER_SEC);
     ts->tv_nsec = (long)(nsec % NSEC_PER_SEC);
+}
+
+static char *get_default_pid_file(void)
+{
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    const char *dir = runtime ? runtime : "/tmp";
+    const char *suffix = "/noctalia-audio-monitor.pid";
+    size_t len = strlen(dir) + strlen(suffix) + 1;
+    char *path = malloc(len);
+    if (path)
+        snprintf(path, len, "%s%s", dir, suffix);
+    return path;
+}
+
+static bool process_is_running(pid_t pid)
+{
+    return kill(pid, 0) == 0;
+}
+
+static bool acquire_pid_file(const char *path)
+{
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0)
+        return false;
+
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return false;
+    }
+
+    /* We hold the lock. Check for a stale pid from a crashed instance. */
+    pid_t existing = 0;
+    char buf[64];
+    ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+    if (n > 0) {
+        buf[n] = '\0';
+        existing = (pid_t)atoi(buf);
+    }
+
+    if (existing > 0 && existing != getpid() && process_is_running(existing)) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        return false;
+    }
+
+    /* Take ownership. */
+    ftruncate(fd, 0);
+    dprintf(fd, "%d\n", getpid());
+
+    /* Keep the file open so the lock is held for the lifetime of the process. */
+    /* We intentionally do not close fd here. */
+    (void)fd;
+    return true;
+}
+
+static void remove_pid_file(void)
+{
+    if (g_pid_file)
+        unlink(g_pid_file);
 }
 
 static void cancel_idle_timer(struct context *ctx)
@@ -91,7 +171,7 @@ static void idle_timer_cb(void *userdata, uint64_t expirations)
     (void)expirations;
     struct context *ctx = userdata;
     ctx->timer = NULL;
-    report_state(ctx, false);
+    report_state(ctx, false, false);
 }
 
 static void arm_idle_timer(struct context *ctx)
@@ -118,13 +198,13 @@ static void update_state(struct context *ctx)
 
     if (active) {
         cancel_idle_timer(ctx);
-        report_state(ctx, true);
+        report_state(ctx, true, false);
     } else {
         /* Level dropped. If we were active, start hysteresis. */
         if (ctx->reported_active)
             arm_idle_timer(ctx);
         else
-            report_state(ctx, false);
+            report_state(ctx, false, false);
     }
 }
 
@@ -359,9 +439,10 @@ static void on_signal(int sig)
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [--threshold T] [--hysteresis-ms N] [--debug]\n"
-            "  --threshold T    audio level threshold (0.0-1.0), default %.4f\n"
-            "  --hysteresis-ms N  idle delay in ms, default %d\n",
+            "Usage: %s [--threshold T] [--hysteresis-ms N] [--state-file PATH] [--debug]\n"
+            "  --threshold T      audio level threshold (0.0-1.0), default %.4f\n"
+            "  --hysteresis-ms N  idle delay in ms, default %d\n"
+            "  --state-file PATH  write state to PATH instead of stdout\n",
             prog, DEFAULT_THRESHOLD, DEFAULT_HYSTERESIS_MS);
 }
 
@@ -375,13 +456,14 @@ int main(int argc, char *argv[])
     static struct option long_options[] = {
         { "threshold",     required_argument, 0, 't' },
         { "hysteresis-ms", required_argument, 0, 'h' },
+        { "state-file",    required_argument, 0, 's' },
         { "debug",         no_argument,       0, 'd' },
         { "help",          no_argument,       0, '?' },
         { 0, 0, 0, 0 }
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "t:h:d", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:h:s:d", long_options, NULL)) != -1) {
         switch (c) {
         case 't':
             g_ctx.threshold = (float)atof(optarg);
@@ -395,6 +477,9 @@ int main(int argc, char *argv[])
             if (g_ctx.hysteresis_ms < 0)
                 g_ctx.hysteresis_ms = 0;
             break;
+        case 's':
+            g_ctx.state_file = strdup(optarg);
+            break;
         case 'd':
             g_ctx.debug = true;
             break;
@@ -402,6 +487,21 @@ int main(int argc, char *argv[])
             print_usage(argv[0]);
             return 1;
         }
+    }
+
+    g_pid_file = get_default_pid_file();
+    if (g_pid_file && !acquire_pid_file(g_pid_file)) {
+        if (g_ctx.debug)
+            fprintf(stderr, "[audio-monitor] another instance is already running\n");
+        free(g_pid_file);
+        g_pid_file = NULL;
+        return 0;
+    }
+
+    if (g_ctx.state_file) {
+        g_ctx.state_fp = fopen(g_ctx.state_file, "w");
+        if (!g_ctx.state_fp && g_ctx.debug)
+            fprintf(stderr, "[audio-monitor] failed to open state file %s\n", g_ctx.state_file);
     }
 
     pw_init(&argc, &argv);
@@ -443,8 +543,7 @@ int main(int argc, char *argv[])
     sigaction(SIGTERM, &sa, NULL);
 
     /* Print initial idle state so the consumer knows we're alive. */
-    printf("idle\n");
-    fflush(stdout);
+    report_state(&g_ctx, false, true);
 
     pw_main_loop_run(g_ctx.loop);
 
@@ -468,7 +567,15 @@ int main(int argc, char *argv[])
     pw_main_loop_destroy(g_ctx.loop);
     pw_deinit();
 
+    if (g_ctx.state_fp) {
+        fclose(g_ctx.state_fp);
+        g_ctx.state_fp = NULL;
+    }
+
+    free(g_ctx.state_file);
     free(g_ctx.default_sink);
+    remove_pid_file();
+    free(g_pid_file);
 
     return 0;
 }

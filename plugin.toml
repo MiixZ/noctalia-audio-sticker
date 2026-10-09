@@ -7,10 +7,6 @@ license      = "MIT"
 description  = "Desktop sticker that fades in and out with audio playback."
 tags         = ["audio", "desktop", "widget", "sticker"]
 
-[[service]]
-id    = "audio-monitor"
-entry = "service.luau"
-
 [[desktop_widget]]
 id    = "sticker"
 entry = "widget.luau"

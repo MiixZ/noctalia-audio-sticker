@@ -13,7 +13,7 @@ audio-monitor:
 install: audio-monitor
 	mkdir -p $(PLUGIN_DIR)
 	rsync -av --exclude='.git' --exclude='audio-monitor/noctalia-audio-monitor' \
-		plugin.toml service.luau widget.luau translations bin audio-monitor README.md LICENSE \
+		plugin.toml widget.luau translations bin audio-monitor README.md LICENSE \
 		$(PLUGIN_DIR)/
 
 clean:
