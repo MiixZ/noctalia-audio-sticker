@@ -15,7 +15,7 @@ A Noctalia desktop widget that shows a sticker image and fades it in/out based o
 - Noctalia shell (plugin API 32 or later)
 - PipeWire with the default sink metadata (`pipewire` + `wireplumber`)
 - `gcc`, `make`, `pkg-config`, `libpipewire-0.3` headers
-- `magick` (ImageMagick) if you want animated GIF support
+- `ffmpeg` (recommended) or `magick` (ImageMagick) if you want animated GIF support
 
 ## Build
 
@@ -97,6 +97,7 @@ You can also run the monitor directly to debug:
 ## Limitations
 
 - The C helper must be built for the target machine; the plugin will show an error if `bin/noctalia-audio-monitor` is missing.
+- Animated GIFs are extracted to a cache folder. Very large/high-resolution GIFs may take longer to process; `ffmpeg` is used automatically when available because it is much faster than ImageMagick for this task.
 
 ## License
 
