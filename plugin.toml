@@ -12,16 +12,6 @@ id    = "sticker"
 entry = "widget.luau"
 
 [[setting]]
-key             = "threshold"
-type            = "double"
-label_key       = "settings.threshold.label"
-description_key = "settings.threshold.description"
-default         = 0.001
-min             = 0.0
-max             = 1.0
-advanced        = true
-
-[[setting]]
 key             = "hysteresis_ms"
 type            = "int"
 label_key       = "settings.hysteresis_ms.label"

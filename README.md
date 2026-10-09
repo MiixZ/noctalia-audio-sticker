@@ -4,10 +4,10 @@ A Noctalia desktop widget that shows a sticker image and fades it in/out based o
 
 ## What it does
 
-- Monitors the **default PipeWire audio sink** using a small C helper.
-- Measures actual audio levels (not just open player streams).
-- Fades the sticker to `active_opacity` when sound is detected.
-- Fades the sticker to `idle_opacity` after audio has been silent for the hysteresis window.
+- Monitors PipeWire output streams using a small C helper.
+- Detects when any output stream is actually running (not just open).
+- Fades the sticker to `active_opacity` when audio is playing.
+- Fades the sticker to `idle_opacity` after all audio has stopped for the hysteresis window.
 
 ## Requirements
 
@@ -75,7 +75,6 @@ These are shared by all widget instances and are found under **Settings → Plug
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `threshold` | double | `0.001` | Audio level considered as "playing" (0.0–1.0). |
 | `hysteresis_ms` | int | `500` | Delay before fading out after audio stops. |
 
 ## Testing

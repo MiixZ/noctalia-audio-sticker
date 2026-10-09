@@ -1,19 +1,18 @@
 /*
  * noctalia-audio-monitor
  *
- * A tiny PipeWire helper that reports whether the default audio sink is
- * currently playing sound. It creates a passive monitor capture stream on the
- * default sink, measures the audio level, and prints:
- *   "active" when the level exceeds the threshold
- *   "idle"   when the level stays below the threshold for the hysteresis window
+ * Monitors PipeWire output streams and reports:
+ *   "active" when any output stream is in the running state
+ *   "idle"   when all output streams are idle/suspended/paused
+ *
+ * This avoids false positives from applications that keep an output stream
+ * open while paused/idle (e.g. Brave, Spotify in "init" state). We care about
+ * streams that are actually playing audio, not just open streams.
  *
  * Usage: noctalia-audio-monitor [--threshold T] [--hysteresis-ms N] [--state-file PATH] [--debug]
  */
 
 #include <pipewire/pipewire.h>
-#include <pipewire/extensions/metadata.h>
-#include <spa/param/audio/format-utils.h>
-#include <spa/param/props.h>
 #include <spa/utils/result.h>
 
 #include <stdio.h>
@@ -24,18 +23,24 @@
 #include <getopt.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
 
-#define DEFAULT_THRESHOLD    0.001f
 #define DEFAULT_HYSTERESIS_MS 500
-#define DEFAULT_SAMPLE_RATE  48000
-#define NSEC_PER_SEC         1000000000ULL
-#define NSEC_PER_MSEC        1000000ULL
+#define MAX_STREAMS 32
+#define NSEC_PER_SEC 1000000000ULL
+#define NSEC_PER_MSEC 1000000ULL
 
 static char *g_pid_file = NULL;
+
+struct stream_node {
+    uint32_t id;
+    struct pw_node *proxy;
+    struct spa_hook listener;
+    enum pw_node_state state;
+    bool used;
+};
 
 struct context {
     struct pw_main_loop *loop;
@@ -44,60 +49,20 @@ struct context {
     struct pw_registry *registry;
     struct spa_hook registry_listener;
 
-    struct pw_metadata *metadata;
-    struct spa_hook metadata_listener;
-    uint32_t metadata_id;
-    char *default_sink;
+    struct stream_node streams[MAX_STREAMS];
 
-    struct pw_stream *stream;
-    struct spa_hook stream_listener;
-    struct spa_audio_info_raw format;
-    bool format_set;
-
-    float threshold;
     int hysteresis_ms;
     bool debug;
     char *state_file;
     FILE *state_fp;
 
     bool reported_active;
-    float smoothed_level;
     struct spa_source *timer;
 };
 
 static struct context g_ctx;
 
 /* ---------- helpers ---------- */
-
-static void report_state(struct context *ctx, bool active, bool force)
-{
-    if (!force && active == ctx->reported_active)
-        return;
-
-    const char *line = active ? "active" : "idle";
-
-    if (ctx->state_fp) {
-        /* Overwrite the file with the latest state. */
-        rewind(ctx->state_fp);
-        ftruncate(fileno(ctx->state_fp), 0);
-        fprintf(ctx->state_fp, "%s\n", line);
-        fflush(ctx->state_fp);
-        if (ctx->debug)
-            fprintf(stderr, "[audio-monitor] wrote state to file: %s\n", line);
-    } else if (ctx->debug) {
-        fprintf(stderr, "[audio-monitor] no state file, printing to stdout\n");
-    }
-
-    printf("%s\n", line);
-    fflush(stdout);
-    ctx->reported_active = active;
-}
-
-static void nsec_to_timespec(uint64_t nsec, struct timespec *ts)
-{
-    ts->tv_sec = (time_t)(nsec / NSEC_PER_SEC);
-    ts->tv_nsec = (long)(nsec % NSEC_PER_SEC);
-}
 
 static char *get_default_pid_file(void)
 {
@@ -127,7 +92,6 @@ static bool acquire_pid_file(const char *path)
         return false;
     }
 
-    /* We hold the lock. Check for a stale pid from a crashed instance. */
     pid_t existing = 0;
     char buf[64];
     ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
@@ -142,12 +106,8 @@ static bool acquire_pid_file(const char *path)
         return false;
     }
 
-    /* Take ownership. */
     ftruncate(fd, 0);
     dprintf(fd, "%d\n", getpid());
-
-    /* Keep the file open so the lock is held for the lifetime of the process. */
-    /* We intentionally do not close fd here. */
     (void)fd;
     return true;
 }
@@ -156,6 +116,25 @@ static void remove_pid_file(void)
 {
     if (g_pid_file)
         unlink(g_pid_file);
+}
+
+static void report_state(struct context *ctx, bool active, bool force)
+{
+    if (!force && active == ctx->reported_active)
+        return;
+
+    const char *line = active ? "active" : "idle";
+
+    if (ctx->state_fp) {
+        rewind(ctx->state_fp);
+        ftruncate(fileno(ctx->state_fp), 0);
+        fprintf(ctx->state_fp, "%s\n", line);
+        fflush(ctx->state_fp);
+    }
+
+    printf("%s\n", line);
+    fflush(stdout);
+    ctx->reported_active = active;
 }
 
 static void cancel_idle_timer(struct context *ctx)
@@ -170,6 +149,8 @@ static void idle_timer_cb(void *userdata, uint64_t expirations)
 {
     (void)expirations;
     struct context *ctx = userdata;
+    if (ctx->debug)
+        fprintf(stderr, "[audio-monitor] idle timer fired\n");
     ctx->timer = NULL;
     report_state(ctx, false, false);
 }
@@ -187,20 +168,31 @@ static void arm_idle_timer(struct context *ctx)
     uint64_t target_ns = (uint64_t)ts.tv_sec * NSEC_PER_SEC + (uint64_t)ts.tv_nsec;
     target_ns += (uint64_t)ctx->hysteresis_ms * NSEC_PER_MSEC;
     struct timespec target;
-    nsec_to_timespec(target_ns, &target);
+    target.tv_sec = (time_t)(target_ns / NSEC_PER_SEC);
+    target.tv_nsec = (long)(target_ns % NSEC_PER_SEC);
     pw_loop_update_timer(pw_main_loop_get_loop(ctx->loop), ctx->timer,
-                         &target, NULL, false);
+                         &target, NULL, true);
 }
 
 static void update_state(struct context *ctx)
 {
-    bool active = ctx->smoothed_level >= ctx->threshold;
+    bool active = false;
+
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (ctx->streams[i].used && ctx->streams[i].state == PW_NODE_STATE_RUNNING) {
+            active = true;
+            break;
+        }
+    }
+
+    if (ctx->debug)
+        fprintf(stderr, "[audio-monitor] update_state active=%d reported=%d\n",
+                active, ctx->reported_active);
 
     if (active) {
         cancel_idle_timer(ctx);
         report_state(ctx, true, false);
     } else {
-        /* Level dropped. If we were active, start hysteresis. */
         if (ctx->reported_active)
             arm_idle_timer(ctx);
         else
@@ -208,218 +200,116 @@ static void update_state(struct context *ctx)
     }
 }
 
-/* ---------- JSON helper (very small, fixed format) ---------- */
+/* ---------- node state ---------- */
 
-static char *extract_name_from_json(const char *json)
+static const char *node_state_name(enum pw_node_state state)
 {
-    const char *key = "\"name\"";
-    const char *p = strstr(json, key);
-    if (!p)
-        return NULL;
-    p += strlen(key);
-    while (*p && (*p == ' ' || *p == ':' || *p == '"'))
-        p++;
-    if (!*p)
-        return NULL;
-
-    const char *end = p;
-    while (*end && *end != '"')
-        end++;
-    if (end == p)
-        return NULL;
-
-    size_t len = (size_t)(end - p);
-    char *name = malloc(len + 1);
-    if (!name)
-        return NULL;
-    memcpy(name, p, len);
-    name[len] = '\0';
-    return name;
+    switch (state) {
+    case PW_NODE_STATE_RUNNING:   return "running";
+    case PW_NODE_STATE_IDLE:      return "idle";
+    case PW_NODE_STATE_SUSPENDED: return "suspended";
+    case PW_NODE_STATE_CREATING:  return "creating";
+    case PW_NODE_STATE_ERROR:     return "error";
+    default:                      return "unknown";
+    }
 }
 
-/* ---------- stream ---------- */
-
-static void stream_process(void *userdata)
+static bool is_output_stream(const struct spa_dict *props)
 {
-    struct context *ctx = userdata;
-    struct pw_buffer *b;
+    const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    return media_class && strcmp(media_class, "Stream/Output/Audio") == 0;
+}
 
-    if (!(b = pw_stream_dequeue_buffer(ctx->stream)))
+static void stream_info_cb(void *data, const struct pw_node_info *info)
+{
+    struct stream_node *stream = data;
+    if (!info)
         return;
 
-    struct spa_buffer *buf = b->buffer;
-    float *samples = NULL;
-    uint32_t n_samples = 0;
+    stream->state = info->state;
+    if (g_ctx.debug)
+        fprintf(stderr, "[audio-monitor] stream %u state=%s\n",
+                stream->id, node_state_name(info->state));
 
-    if (buf->datas[0].data) {
-        samples = buf->datas[0].data;
-        n_samples = buf->datas[0].chunk->size / sizeof(float);
-    }
-
-    float peak = 0.0f;
-    if (samples && n_samples > 0) {
-        for (uint32_t i = 0; i < n_samples; i++) {
-            float s = fabsf(samples[i]);
-            if (s > peak)
-                peak = s;
-        }
-    }
-
-    /* Exponential smoothing for a less jittery response. */
-    ctx->smoothed_level += (peak - ctx->smoothed_level) * 0.3f;
-
-    if (ctx->debug && peak > 0.0f)
-        fprintf(stderr, "[audio-monitor] peak=%.6f smoothed=%.6f\n",
-                peak, ctx->smoothed_level);
-
-    update_state(ctx);
-    pw_stream_queue_buffer(ctx->stream, b);
+    update_state(&g_ctx);
 }
 
-static void stream_param_changed(void *userdata, uint32_t id, const struct spa_pod *param)
-{
-    struct context *ctx = userdata;
-
-    if (param == NULL || id != SPA_PARAM_Format)
-        return;
-
-    spa_format_audio_raw_parse(param, &ctx->format);
-    ctx->format_set = true;
-
-    if (ctx->debug)
-        fprintf(stderr, "[audio-monitor] format: rate=%d channels=%d\n",
-                ctx->format.rate, ctx->format.channels);
-}
-
-static const struct pw_stream_events stream_events = {
-    PW_VERSION_STREAM_EVENTS,
-    .param_changed = stream_param_changed,
-    .process = stream_process,
-};
-
-static void connect_monitor_stream(struct context *ctx)
-{
-    if (!ctx->default_sink)
-        return;
-
-    if (ctx->stream) {
-        pw_stream_disconnect(ctx->stream);
-        pw_stream_destroy(ctx->stream);
-        spa_hook_remove(&ctx->stream_listener);
-        ctx->stream = NULL;
-    }
-
-    const struct spa_pod *params[1];
-    uint8_t buffer[1024];
-    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-
-    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
-        &SPA_AUDIO_INFO_RAW_INIT(
-            .format = SPA_AUDIO_FORMAT_F32,
-            .channels = 2,
-            .rate = DEFAULT_SAMPLE_RATE,
-            .position = { SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR }
-        ));
-
-    struct pw_properties *props = pw_properties_new(
-        PW_KEY_MEDIA_TYPE,        "Audio",
-        PW_KEY_MEDIA_CATEGORY,    "Capture",
-        PW_KEY_MEDIA_CLASS,       "Stream/Input/Audio",
-        PW_KEY_STREAM_MONITOR,    "true",
-        PW_KEY_STREAM_CAPTURE_SINK, "true",
-        PW_KEY_NODE_PASSIVE,      "true",
-        PW_KEY_TARGET_OBJECT,     ctx->default_sink,
-        PW_KEY_NODE_NAME,         "noctalia-audio-monitor",
-        PW_KEY_MEDIA_NAME,        "Noctalia Audio Sticker Monitor",
-        NULL);
-
-    ctx->stream = pw_stream_new(ctx->core, "noctalia-audio-monitor", props);
-    pw_stream_add_listener(ctx->stream, &ctx->stream_listener, &stream_events, ctx);
-    pw_stream_connect(ctx->stream,
-                      PW_DIRECTION_INPUT,
-                      PW_ID_ANY,
-                      PW_STREAM_FLAG_AUTOCONNECT |
-                      PW_STREAM_FLAG_MAP_BUFFERS |
-                      PW_STREAM_FLAG_RT_PROCESS,
-                      params, 1);
-
-    if (ctx->debug)
-        fprintf(stderr, "[audio-monitor] connected monitor to %s\n", ctx->default_sink);
-}
-
-/* ---------- metadata ---------- */
-
-static int metadata_property(void *data, uint32_t subject,
-                             const char *key, const char *type,
-                             const char *value)
-{
-    (void)subject;
-    (void)type;
-    struct context *ctx = data;
-
-    if (!key || !value)
-        return 0;
-    if (strcmp(key, "default.audio.sink") != 0)
-        return 0;
-
-    char *name = extract_name_from_json(value);
-    if (!name)
-        return 0;
-
-    if (ctx->debug)
-        fprintf(stderr, "[audio-monitor] default sink changed: %s\n", name);
-
-    free(ctx->default_sink);
-    ctx->default_sink = name;
-
-    connect_monitor_stream(ctx);
-    return 0;
-}
-
-static const struct pw_metadata_events metadata_events = {
-    PW_VERSION_METADATA_EVENTS,
-    .property = metadata_property,
+static const struct pw_node_events stream_node_events = {
+    PW_VERSION_NODE_EVENTS,
+    .info = stream_info_cb,
 };
 
 /* ---------- registry ---------- */
+
+static struct stream_node *find_stream_slot(struct context *ctx)
+{
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (!ctx->streams[i].used)
+            return &ctx->streams[i];
+    }
+    return NULL;
+}
+
+static struct stream_node *find_stream_by_id(struct context *ctx, uint32_t id)
+{
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (ctx->streams[i].used && ctx->streams[i].id == id)
+            return &ctx->streams[i];
+    }
+    return NULL;
+}
+
+static void add_stream(struct context *ctx, uint32_t id)
+{
+    struct stream_node *stream = find_stream_slot(ctx);
+    if (!stream)
+        return;
+
+    stream->proxy = pw_registry_bind(ctx->registry, id, PW_TYPE_INTERFACE_Node,
+                                     PW_VERSION_NODE, 0);
+    if (!stream->proxy)
+        return;
+
+    stream->id = id;
+    stream->state = PW_NODE_STATE_CREATING;
+    stream->used = true;
+
+    pw_node_add_listener(stream->proxy, &stream->listener,
+                         &stream_node_events, stream);
+}
 
 static void registry_global(void *data, uint32_t id, uint32_t permissions,
                             const char *type, uint32_t version,
                             const struct spa_dict *props)
 {
     (void)permissions;
+    (void)version;
     struct context *ctx = data;
 
-    if (strcmp(type, PW_TYPE_INTERFACE_Metadata) != 0)
+    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
         return;
 
-    const char *name = spa_dict_lookup(props, "metadata.name");
-    if (!name || strcmp(name, "default") != 0)
+    if (find_stream_by_id(ctx, id))
         return;
 
-    /* Already bound? */
-    if (ctx->metadata)
+    if (!is_output_stream(props))
         return;
 
-    ctx->metadata_id = id;
-    ctx->metadata = pw_registry_bind(ctx->registry, id, type, version, 0);
-    if (!ctx->metadata)
-        return;
-
-    pw_metadata_add_listener(ctx->metadata, &ctx->metadata_listener,
-                             &metadata_events, ctx);
+    add_stream(ctx, id);
 }
 
 static void registry_global_remove(void *data, uint32_t id)
 {
     struct context *ctx = data;
-    if (ctx->metadata_id != id)
+
+    struct stream_node *stream = find_stream_by_id(ctx, id);
+    if (!stream)
         return;
 
-    spa_hook_remove(&ctx->metadata_listener);
-    pw_proxy_destroy((struct pw_proxy *)ctx->metadata);
-    ctx->metadata = NULL;
-    ctx->metadata_id = 0;
+    spa_hook_remove(&stream->listener);
+    pw_proxy_destroy((struct pw_proxy *)stream->proxy);
+    memset(stream, 0, sizeof(*stream));
+    update_state(ctx);
 }
 
 static const struct pw_registry_events registry_events = {
@@ -440,18 +330,16 @@ static void print_usage(const char *prog)
 {
     fprintf(stderr,
             "Usage: %s [--threshold T] [--hysteresis-ms N] [--state-file PATH] [--debug]\n"
-            "  --threshold T      audio level threshold (0.0-1.0), default %.4f\n"
+            "  --threshold T      ignored, kept for compatibility\n"
             "  --hysteresis-ms N  idle delay in ms, default %d\n"
             "  --state-file PATH  write state to PATH instead of stdout\n",
-            prog, DEFAULT_THRESHOLD, DEFAULT_HYSTERESIS_MS);
+            prog, DEFAULT_HYSTERESIS_MS);
 }
 
 int main(int argc, char *argv[])
 {
     memset(&g_ctx, 0, sizeof(g_ctx));
-    g_ctx.threshold = DEFAULT_THRESHOLD;
     g_ctx.hysteresis_ms = DEFAULT_HYSTERESIS_MS;
-    g_ctx.smoothed_level = 0.0f;
 
     static struct option long_options[] = {
         { "threshold",     required_argument, 0, 't' },
@@ -466,11 +354,6 @@ int main(int argc, char *argv[])
     while ((c = getopt_long(argc, argv, "t:h:s:d", long_options, NULL)) != -1) {
         switch (c) {
         case 't':
-            g_ctx.threshold = (float)atof(optarg);
-            if (g_ctx.threshold < 0.0f)
-                g_ctx.threshold = 0.0f;
-            if (g_ctx.threshold > 1.0f)
-                g_ctx.threshold = 1.0f;
             break;
         case 'h':
             g_ctx.hysteresis_ms = atoi(optarg);
@@ -507,31 +390,17 @@ int main(int argc, char *argv[])
     pw_init(&argc, &argv);
 
     g_ctx.loop = pw_main_loop_new(NULL);
-    if (!g_ctx.loop) {
-        fprintf(stderr, "Failed to create PipeWire main loop\n");
-        return 1;
-    }
-
     g_ctx.pw_context = pw_context_new(pw_main_loop_get_loop(g_ctx.loop), NULL, 0);
-    if (!g_ctx.pw_context) {
-        fprintf(stderr, "Failed to create PipeWire context\n");
-        return 1;
-    }
-
     g_ctx.core = pw_context_connect(g_ctx.pw_context, NULL, 0);
     if (!g_ctx.core) {
-        fprintf(stderr, "Failed to connect to PipeWire: %s\n", strerror(errno));
+        fprintf(stderr, "[audio-monitor] failed to connect to PipeWire: %s\n", strerror(errno));
         return 1;
     }
 
     g_ctx.registry = pw_core_get_registry(g_ctx.core, PW_VERSION_REGISTRY, 0);
-    if (!g_ctx.registry) {
-        fprintf(stderr, "Failed to get PipeWire registry\n");
-        return 1;
-    }
-
     pw_registry_add_listener(g_ctx.registry, &g_ctx.registry_listener,
                              &registry_events, &g_ctx);
+
     pw_core_sync(g_ctx.core, PW_ID_CORE, 0);
 
     struct sigaction sa;
@@ -542,7 +411,7 @@ int main(int argc, char *argv[])
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /* Print initial idle state so the consumer knows we're alive. */
+    /* Initial idle until streams report their state. */
     report_state(&g_ctx, false, true);
 
     pw_main_loop_run(g_ctx.loop);
@@ -550,15 +419,11 @@ int main(int argc, char *argv[])
     /* Cleanup */
     cancel_idle_timer(&g_ctx);
 
-    if (g_ctx.stream) {
-        spa_hook_remove(&g_ctx.stream_listener);
-        pw_stream_disconnect(g_ctx.stream);
-        pw_stream_destroy(g_ctx.stream);
-    }
-
-    if (g_ctx.metadata) {
-        spa_hook_remove(&g_ctx.metadata_listener);
-        pw_proxy_destroy((struct pw_proxy *)g_ctx.metadata);
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (!g_ctx.streams[i].used)
+            continue;
+        spa_hook_remove(&g_ctx.streams[i].listener);
+        pw_proxy_destroy((struct pw_proxy *)g_ctx.streams[i].proxy);
     }
 
     pw_proxy_destroy((struct pw_proxy *)g_ctx.registry);
@@ -567,13 +432,9 @@ int main(int argc, char *argv[])
     pw_main_loop_destroy(g_ctx.loop);
     pw_deinit();
 
-    if (g_ctx.state_fp) {
+    if (g_ctx.state_fp)
         fclose(g_ctx.state_fp);
-        g_ctx.state_fp = NULL;
-    }
-
     free(g_ctx.state_file);
-    free(g_ctx.default_sink);
     remove_pid_file();
     free(g_pid_file);
 

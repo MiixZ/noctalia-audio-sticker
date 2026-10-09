@@ -41,8 +41,10 @@ local function render()
   desktopWidget.render(
     ui.image({
       path = path,
+      width = 320,
+      height = 320,
       opacity = opacity,
-      fit = "contain",
+      fit = "cover",
     })
   )
 end
@@ -53,21 +55,16 @@ local function setActive(active)
     or  (noctalia.getConfig("idle_opacity") or 0.0)
 end
 
--- Start the helper in the background. It uses an internal flock-based
--- single-instance guard, so starting it again is harmless if one is already
--- running from a previous widget load.
 local function startMonitor()
   if not noctalia.fileExists(helperPath) then
     return
   end
 
-  local threshold = noctalia.getConfig("threshold") or 0.001
   local hysteresis = noctalia.getConfig("hysteresis_ms") or 500
 
   local cmd = table.concat({
     "nohup",
     helperPath,
-    "--threshold", tostring(threshold),
     "--hysteresis-ms", tostring(hysteresis),
     "--state-file", stateFile,
     ">/dev/null",
@@ -80,14 +77,17 @@ end
 
 startMonitor()
 
--- Seed initial opacity.
-local active = readState()
-setActive(active == true)
-currentOpacity = targetOpacity
-opacity = targetOpacity
-render()
+function update()
+  desktopWidget.setNeedsFrameTick(true)
 
-desktopWidget.setNeedsFrameTick(true)
+  local active = readState()
+  setActive(active == true)
+  currentOpacity = targetOpacity
+  opacity = targetOpacity
+  previousState = active
+
+  render()
+end
 
 function onFrameTick(deltaMs)
   local active = readState()
@@ -108,8 +108,4 @@ function onFrameTick(deltaMs)
     opacity = currentOpacity
     render()
   end
-end
-
-function update()
-  -- Kept in case Noctalia calls it; no periodic work needed.
 end

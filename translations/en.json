@@ -7,8 +7,6 @@
   "settings.idle_opacity.description": "Opacity when audio is silent.",
   "settings.fade_ms.label": "Fade duration (ms)",
   "settings.fade_ms.description": "How long the fade in/out transition lasts.",
-  "settings.threshold.label": "Audio threshold",
-  "settings.threshold.description": "Minimum audio level considered as playing (0.0-1.0).",
   "settings.hysteresis_ms.label": "Idle hysteresis (ms)",
   "settings.hysteresis_ms.description": "Delay before fading out after audio stops."
 }
