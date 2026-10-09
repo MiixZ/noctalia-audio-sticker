@@ -83,12 +83,14 @@ local function parseFfmpegDurations(stdout)
   return durations, total
 end
 
-local function saveGifMetadata(cacheDir, frames, durations, totalDuration, extractor)
+local function saveGifMetadata(cacheDir, frames, durations, totalDuration, extractor, sourceMtime, sourceSize)
   local meta = {
     frames = frames,
     durations = durations,
     totalDuration = totalDuration,
     extractor = extractor or "unknown",
+    sourceMtime = sourceMtime,
+    sourceSize = sourceSize,
   }
   local ok, encoded = pcall(noctalia.json.encode, meta)
   if ok then
@@ -96,7 +98,7 @@ local function saveGifMetadata(cacheDir, frames, durations, totalDuration, extra
   end
 end
 
-local function loadGifMetadata(cacheDir)
+local function loadGifMetadata(cacheDir, path)
   local raw = noctalia.readFile(cacheDir .. "/metadata.json")
   if not raw then
     return false
@@ -104,6 +106,20 @@ local function loadGifMetadata(cacheDir)
   local ok, meta = pcall(noctalia.json.decode, raw)
   if not ok or not meta or not meta.frames then
     return false
+  end
+
+  -- Invalidate cache if the source file has changed.
+  -- Also invalidate legacy caches that lack source metadata.
+  if path then
+    if meta.sourceMtime == nil or meta.sourceSize == nil then
+      return false
+    end
+    local info = noctalia.fileInfo(path)
+    if info then
+      if meta.sourceMtime ~= info.mtime or meta.sourceSize ~= info.size then
+        return false
+      end
+    end
   end
 
   gifFrames = {}
@@ -115,12 +131,12 @@ local function loadGifMetadata(cacheDir)
   return true
 end
 
-local function finalizeFrames(cacheDir, frameCount, startIndex, durations, totalDuration, extractor)
+local function finalizeFrames(cacheDir, frameCount, startIndex, durations, totalDuration, extractor, sourceMtime, sourceSize)
   local frames = {}
   for i = 0, frameCount - 1 do
     table.insert(frames, string.format("frame-%03d.png", startIndex + i))
   end
-  saveGifMetadata(cacheDir, frames, durations, totalDuration, extractor)
+  saveGifMetadata(cacheDir, frames, durations, totalDuration, extractor, sourceMtime, sourceSize)
 
   gifFrames = {}
   for _, name in ipairs(frames) do
@@ -132,7 +148,7 @@ local function finalizeFrames(cacheDir, frameCount, startIndex, durations, total
   gifLoading = false
 end
 
-local function extractWithMagick(path, cacheDir)
+local function extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
   -- Read frame durations first; this also tells us how many frames exist.
   noctalia.runAsync({
     "magick", "identify", "-format", "%T\n", path
@@ -162,7 +178,7 @@ local function extractWithMagick(path, cacheDir)
     end
 
     if cached then
-      finalizeFrames(cacheDir, frameCount, 0, durations, totalDuration, "magick")
+      finalizeFrames(cacheDir, frameCount, 0, durations, totalDuration, "magick", sourceMtime, sourceSize)
       return
     end
 
@@ -175,12 +191,12 @@ local function extractWithMagick(path, cacheDir)
         gifLoading = false
         return
       end
-      finalizeFrames(cacheDir, frameCount, 0, durations, totalDuration, "magick")
+      finalizeFrames(cacheDir, frameCount, 0, durations, totalDuration, "magick", sourceMtime, sourceSize)
     end)
   end)
 end
 
-local function extractWithFfmpeg(path, cacheDir)
+local function extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
   -- ffmpeg starts output at frame-001.png; probe duration first.
   noctalia.runAsync({
     "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -189,7 +205,7 @@ local function extractWithFfmpeg(path, cacheDir)
   }, function(probe)
     if probe.exitCode ~= 0 then
       noctalia.log("ffprobe failed: " .. (probe.stderr or ""))
-      extractWithMagick(path, cacheDir)
+      extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
       return
     end
 
@@ -212,7 +228,7 @@ local function extractWithFfmpeg(path, cacheDir)
     end
 
     if cached then
-      finalizeFrames(cacheDir, frameCount, 1, durations, totalDuration, "ffmpeg")
+      finalizeFrames(cacheDir, frameCount, 1, durations, totalDuration, "ffmpeg", sourceMtime, sourceSize)
       return
     end
 
@@ -225,10 +241,10 @@ local function extractWithFfmpeg(path, cacheDir)
     }, function(result)
       if result.exitCode ~= 0 then
         noctalia.log("ffmpeg extraction failed: " .. (result.stderr or ""))
-        extractWithMagick(path, cacheDir)
+        extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
         return
       end
-      finalizeFrames(cacheDir, frameCount, 1, durations, totalDuration, "ffmpeg")
+      finalizeFrames(cacheDir, frameCount, 1, durations, totalDuration, "ffmpeg", sourceMtime, sourceSize)
     end)
   end)
 end
@@ -248,8 +264,12 @@ local function extractGifFrames(path)
   local cacheDir = gifCacheDir(path)
   noctalia.mkdirAll(cacheDir)
 
-  -- Use cached metadata if available.
-  if loadGifMetadata(cacheDir) then
+  local sourceInfo = noctalia.fileInfo(path)
+  local sourceMtime = sourceInfo and sourceInfo.mtime or 0
+  local sourceSize = sourceInfo and sourceInfo.size or 0
+
+  -- Use cached metadata if available and the source file has not changed.
+  if loadGifMetadata(cacheDir, path) then
     gifPath = path
     gifStartTime = noctalia.nowMs()
     gifLoading = false
@@ -257,9 +277,9 @@ local function extractGifFrames(path)
   end
 
   if noctalia.commandExists("ffmpeg") then
-    extractWithFfmpeg(path, cacheDir)
+    extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
   elseif noctalia.commandExists("magick") then
-    extractWithMagick(path, cacheDir)
+    extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
   else
     noctalia.log("ffmpeg or ImageMagick is required for GIF support")
     gifLoading = false
