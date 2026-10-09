@@ -1,0 +1,71 @@
+id           = "miixz/audio-sticker"
+name         = "Audio Reactive Sticker"
+version      = "1.0.0"
+plugin_api   = 32
+author       = "miixz"
+license      = "MIT"
+description  = "Desktop sticker that fades in and out with audio playback."
+tags         = ["audio", "desktop", "widget", "sticker"]
+
+[[service]]
+id    = "audio-monitor"
+entry = "service.luau"
+
+[[desktop_widget]]
+id    = "sticker"
+entry = "widget.luau"
+
+[[setting]]
+key             = "threshold"
+type            = "double"
+label_key       = "settings.threshold.label"
+description_key = "settings.threshold.description"
+default         = 0.001
+min             = 0.0
+max             = 1.0
+advanced        = true
+
+[[setting]]
+key             = "hysteresis_ms"
+type            = "int"
+label_key       = "settings.hysteresis_ms.label"
+description_key = "settings.hysteresis_ms.description"
+default         = 500
+min             = 0
+max             = 5000
+advanced        = true
+
+[[desktop_widget.setting]]
+key             = "image_path"
+type            = "file"
+label_key       = "settings.image_path.label"
+description_key = "settings.image_path.description"
+extensions      = [".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif"]
+default         = ""
+
+[[desktop_widget.setting]]
+key             = "active_opacity"
+type            = "double"
+label_key       = "settings.active_opacity.label"
+description_key = "settings.active_opacity.description"
+default         = 1.0
+min             = 0.0
+max             = 1.0
+
+[[desktop_widget.setting]]
+key             = "idle_opacity"
+type            = "double"
+label_key       = "settings.idle_opacity.label"
+description_key = "settings.idle_opacity.description"
+default         = 0.0
+min             = 0.0
+max             = 1.0
+
+[[desktop_widget.setting]]
+key             = "fade_ms"
+type            = "int"
+label_key       = "settings.fade_ms.label"
+description_key = "settings.fade_ms.description"
+default         = 300
+min             = 0
+max             = 10000

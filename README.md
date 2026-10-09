@@ -1,0 +1,103 @@
+# Audio Reactive Sticker for Noctalia
+
+A Noctalia desktop widget that shows a sticker image and fades it in/out based on real audio playback.
+
+## What it does
+
+- Monitors the **default PipeWire audio sink** using a small C helper.
+- Measures actual audio levels (not just open player streams).
+- Fades the sticker to `active_opacity` when sound is detected.
+- Fades the sticker to `idle_opacity` after audio has been silent for the hysteresis window.
+
+## Requirements
+
+- Noctalia shell (plugin API 32 or later)
+- PipeWire with the default sink metadata (`pipewire` + `wireplumber`)
+- `gcc`, `make`, `pkg-config`, `libpipewire-0.3` headers
+
+## Build
+
+```bash
+make
+```
+
+This compiles `audio-monitor/noctalia-audio-monitor` and copies it to `bin/`.
+
+## Install
+
+### Local install (development)
+
+```bash
+make install
+```
+
+This copies the plugin to `~/.local/share/noctalia/plugins/audio-sticker/`.
+
+### Enable in Noctalia
+
+```bash
+noctalia msg plugins enable miixz/audio-sticker
+```
+
+Then add a desktop widget of type `miixz/audio-sticker:sticker` via the desktop widgets editor, or by editing `settings.toml`:
+
+```toml
+[desktop_widgets.widget.my-audio-sticker]
+type     = "miixz/audio-sticker:sticker"
+output   = "DP-2"
+cx       = 1280.0
+cy       = 720.0
+box_width  = 256.0
+box_height = 256.0
+rotation = 0.0
+
+    [desktop_widgets.widget.my-audio-sticker.settings]
+    image_path     = "/home/calvo/Pictures/Chitoge Stickers/chitoge.png"
+    active_opacity = 1.0
+    idle_opacity   = 0.0
+    fade_ms        = 300
+```
+
+## Settings
+
+### Per-widget settings
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `image_path` | file | `''` | Path to the sticker image (PNG, JPG, WebP, SVG, or animated GIF). |
+| `active_opacity` | double | `1.0` | Opacity when audio is playing. |
+| `idle_opacity` | double | `0.0` | Opacity when audio is silent. |
+| `fade_ms` | int | `300` | Fade in/out duration in milliseconds. |
+
+### Plugin-level settings
+
+These are shared by all widget instances and are found under **Settings → Plugins → Audio Reactive Sticker**.
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `threshold` | double | `0.001` | Audio level considered as "playing" (0.0–1.0). |
+| `hysteresis_ms` | int | `500` | Delay before fading out after audio stops. |
+
+## Testing
+
+1. Make sure music or a video is paused.
+2. The sticker should be at `idle_opacity`.
+3. Start playback.
+4. The sticker should fade to `active_opacity`.
+5. Pause playback.
+6. After `hysteresis_ms`, the sticker should fade back to `idle_opacity`.
+
+You can also run the monitor directly to debug:
+
+```bash
+./bin/noctalia-audio-monitor --debug
+```
+
+## Limitations
+
+- **Desktop only.** Noctalia does not allow plugins to add lockscreen widgets, so this cannot be used on the lock screen.
+- The C helper must be built for the target machine; the plugin will show an error if `bin/noctalia-audio-monitor` is missing.
+
+## License
+
+MIT
