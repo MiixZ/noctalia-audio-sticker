@@ -10,6 +10,13 @@ A Noctalia desktop widget that shows a sticker image and fades it in/out based o
 - Fades the sticker to `idle_opacity` after all audio has stopped for the hysteresis window.
 - Supports static images (PNG, JPEG, WebP, SVG) and **animated GIFs**.
 
+## Demo
+
+The sticker fades in when audio starts playing and fades out when playback stops.
+
+https://github.com/user-attachments/assets/84cb0612-8bdb-4727-a319-b5d509568e9a
+
+
 ## Requirements
 
 - Noctalia shell (plugin API 32 or later)
@@ -99,6 +106,9 @@ You can also run the monitor directly to debug:
 - The C helper must be built for the target machine; the plugin will show an error if `bin/noctalia-audio-monitor` is missing.
 - Animated GIFs are extracted to a cache folder. Very large/high-resolution GIFs may take longer to process; `ffmpeg` is used automatically when available because it is much faster than ImageMagick for this task.
 
-## License
+### Credits
+- Background Music: "burger" by bbno$ (Cleared for creator use)
 
-MIT
+## Friendly Reminding
+
+Also try Nisekoi :)
