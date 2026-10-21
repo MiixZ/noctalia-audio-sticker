@@ -207,7 +207,11 @@ jobs:
           gh auth setup-git
           git -C "${RUNNER_TEMP}/community" push --force "https://github.com/${FORK_REPO}.git" "HEAD:refs/heads/${BRANCH}"
 
-          pr_number="$(gh pr list --repo "${UPSTREAM_REPO}" --head "${FORK_OWNER}:${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          pr_number="$(gh pr list --repo "${UPSTREAM_REPO}" --state open \
+            --json number,headRefName,headRepositoryOwner \
+            --jq '.[] | "\(.number) \(.headRefName) \((.headRepositoryOwner // {}).login)"' \
+            | awk -v owner="${FORK_OWNER}" -v branch="${BRANCH}" \
+              '$2 == branch && $3 == owner { print $1; exit }')"
           if [ -n "${pr_number}" ]; then
             echo "::notice::Updated the existing pull request #${pr_number}."
           else
