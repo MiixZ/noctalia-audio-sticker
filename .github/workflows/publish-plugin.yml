@@ -1,0 +1,220 @@
+name: Publish to community-plugins
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (for example v1.2.0). Leave empty to use the version in plugin.toml."
+        required: false
+        type: string
+      dry_run:
+        description: "Stage and validate only; do not push or open a pull request."
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-audio-sticker
+  cancel-in-progress: false
+
+env:
+  PLUGIN_DIR: audio-sticker
+  PLUGIN_ID: miixz/audio-sticker
+  UPSTREAM_REPO: noctalia-dev/community-plugins
+  FORK_REPO: MiixZ/community-plugins
+  FORK_OWNER: MiixZ
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the plugin repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve the version and check the manifest
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_TAG}" ]; then
+            ref="${INPUT_TAG}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            ref="${GITHUB_REF_NAME}"
+          else
+            ref=""
+          fi
+
+          manifest_version="$(python3 -c 'import tomllib; print(tomllib.load(open("plugin.toml", "rb"))["version"])')"
+
+          if [ -n "${ref}" ]; then
+            version="${ref#v}"
+            if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::'${ref}' is not a vX.Y.Z tag."
+              exit 1
+            fi
+            if [ "${manifest_version}" != "${version}" ]; then
+              echo "::error::plugin.toml says ${manifest_version} but the tag is ${ref}. Bump the manifest before tagging."
+              exit 1
+            fi
+          else
+            version="${manifest_version}"
+            if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::plugin.toml version '${version}' is not semver."
+              exit 1
+            fi
+            echo "::notice::No tag given; publishing plugin.toml version ${version}."
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "branch=publish/${PLUGIN_DIR}-v${version}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing ${PLUGIN_ID} v${version}"
+
+      - name: Check out the community repository
+        run: git clone --depth=1 "https://github.com/${UPSTREAM_REPO}.git" upstream
+
+      - name: Detect whether this is a new plugin or an update
+        id: kind
+        run: |
+          set -euo pipefail
+          if git -C upstream cat-file -e "HEAD:${PLUGIN_DIR}/plugin.toml" 2>/dev/null; then
+            echo "action=update" >> "${GITHUB_OUTPUT}"
+          else
+            echo "action=add" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Render the pull request description
+        env:
+          ACTION: ${{ steps.kind.outputs.action }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "${ACTION}" = "update" ]; then
+            new_box=" "
+            update_box="x"
+          else
+            new_box="x"
+            update_box=" "
+          fi
+
+          sed \
+            -e "s/{{VERSION}}/${VERSION}/g" \
+            -e "s/{{NEW}}/${new_box}/g" \
+            -e "s/{{UPDATE}}/${update_box}/g" \
+            .github/pr-body.md > "${RUNNER_TEMP}/pr-body.md"
+
+      - name: Check the pull request description
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/check-pr-body.py \
+            "${RUNNER_TEMP}/pr-body.md" \
+            upstream/.github/workflows/scripts/enforce-pr-template.py
+
+      - name: Stage the plugin directory
+        run: |
+          set -euo pipefail
+          rm -rf "upstream/${PLUGIN_DIR}"
+          mkdir -p "upstream/${PLUGIN_DIR}"
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='/Makefile' \
+            --exclude='/LICENSE' \
+            --exclude='/bin/' \
+            --exclude='/src/' \
+            ./ "upstream/${PLUGIN_DIR}/"
+
+      - name: Validate the community manifest
+        run: |
+          set -euo pipefail
+          cd upstream
+          python3 .github/workflows/scripts/validate-plugins.py
+
+      - name: Show what would be published
+        run: |
+          set -euo pipefail
+          git -C upstream add -- "${PLUGIN_DIR}"
+          git -C upstream diff --cached --stat
+          if git -C upstream diff --cached --quiet; then
+            echo "No changes against upstream main."
+          fi
+
+      - name: Stop before publishing (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          echo "Dry run: nothing was pushed and no pull request was opened."
+          echo "Version: v${{ steps.version.outputs.version }}"
+          echo "Branch that would be created: ${{ steps.version.outputs.branch }}"
+
+      - name: Publish the branch and the pull request
+        if: github.event_name == 'push' || inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.PLUGIN_PUBLISH_TOKEN }}
+          ACTION: ${{ steps.kind.outputs.action }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::PLUGIN_PUBLISH_TOKEN is not configured in this repository."
+            exit 1
+          fi
+
+          # One open publish pull request at a time per plugin.
+          open_prs="$(gh pr list --repo "${UPSTREAM_REPO}" --state open \
+            --json number,headRefName,headRepositoryOwner \
+            --jq '.[] | "\(.number) \(.headRefName) \((.headRepositoryOwner // {}).login)"')"
+          others="$(printf '%s\n' "${open_prs}" | awk \
+            -v owner="${FORK_OWNER}" \
+            -v prefix="publish/${PLUGIN_DIR}-v" \
+            -v branch="${BRANCH}" \
+            '$3 == owner && index($2, prefix) == 1 && $2 != branch { print "#" $1 " " $2 }')"
+          if [ -n "${others}" ]; then
+            echo "::error::Another publish pull request is still open: ${others}"
+            exit 1
+          fi
+
+          if [ "${ACTION}" = "update" ]; then
+            title="feat(${PLUGIN_DIR}): update to v${VERSION}"
+          else
+            title="feat(${PLUGIN_DIR}): add audio reactive sticker plugin"
+          fi
+
+          git -C upstream config user.name "github-actions[bot]"
+          git -C upstream config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C upstream switch -c "${BRANCH}"
+
+          if git -C upstream diff --cached --quiet; then
+            echo "::notice::The plugin is identical to upstream main; no pull request is needed."
+            exit 0
+          fi
+
+          git -C upstream commit -m "${title}"
+          gh auth setup-git
+          git -C upstream push --force "https://github.com/${FORK_REPO}.git" "HEAD:refs/heads/${BRANCH}"
+
+          pr_number="$(gh pr list --repo "${UPSTREAM_REPO}" --head "${FORK_OWNER}:${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "${pr_number}" ]; then
+            echo "::notice::Updated the existing pull request #${pr_number}."
+          else
+            gh pr create \
+              --repo "${UPSTREAM_REPO}" \
+              --base main \
+              --head "${FORK_OWNER}:${BRANCH}" \
+              --title "${title}" \
+              --body-file "${RUNNER_TEMP}/pr-body.md" \
+              --draft
+          fi

@@ -1,8 +1,2 @@
-# Build artifacts
-/bin/
-
-# Editor / OS
-*.swp
-*.swo
-*~
-.DS_Store
+# Built on first run by service.luau from native/; never commit it.
+bin/
