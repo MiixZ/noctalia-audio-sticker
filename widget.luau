@@ -1,12 +1,25 @@
-local pluginDir = noctalia.pluginDir() or ""
-local helperPath = pluginDir .. "/bin/noctalia-audio-monitor"
-local dataDir = noctalia.pluginDataDir() or ("/tmp/noctalia-audio-sticker-" .. tostring(os.time()))
-local stateFile = dataDir .. "/monitor-state.txt"
+--!nonstrict
+-- Audio Reactive Sticker desktop widget.
+--
+-- Draws the configured image and fades it between idle_opacity and
+-- active_opacity. Playback state comes from the plugin's monitor service,
+-- which owns the PipeWire helper: this file never starts a process of its own,
+-- so several stickers share one monitor.
+
+local ACTIVE_KEY = "audio_sticker.active"
+local STATUS_KEY = "audio_sticker.status"
+
+local dataDir = noctalia.pluginDataDir()
+if dataDir == nil then
+  dataDir = ""
+end
+
+local active = noctalia.state.get(ACTIVE_KEY) == true
+local status = noctalia.state.get(STATUS_KEY)
 
 local opacity = 0.0
-local targetOpacity = 0.0
 local currentOpacity = 0.0
-local previousState = nil
+local targetOpacity = 0.0
 
 -- GIF animation state
 local gifPath = nil
@@ -17,24 +30,6 @@ local gifStartTime = 0
 local gifLoading = false
 local gifLoadStart = 0
 
-local function trim(s)
-  return (s:gsub("^%s*(.-)%s*$", "%1"))
-end
-
-local function readState()
-  local content = noctalia.readFile(stateFile)
-  if not content then
-    return nil
-  end
-  content = trim(content)
-  if content == "active" then
-    return true
-  elseif content == "idle" then
-    return false
-  end
-  return nil
-end
-
 local function isGif(path)
   return path:lower():match("%.gif$") ~= nil
 end
@@ -43,22 +38,6 @@ local function gifCacheDir(path)
   local safe = path:gsub("[^a-zA-Z0-9_.-]", "_")
   safe = safe:gsub("%.gif$", "") -- avoid a directory name ending in .gif
   return dataDir .. "/gif-cache/" .. safe
-end
-
-local function parseGifDurations(stdout)
-  local durations = {}
-  local total = 0
-  for line in stdout:gmatch("[^\r\n]+") do
-    local ticks = tonumber(line) or 10
-    -- ImageMagick %T reports delay in hundredths of a second by default.
-    local ms = math.floor(ticks * 10)
-    if ms <= 0 then
-      ms = 100
-    end
-    table.insert(durations, ms)
-    total = total + ms
-  end
-  return durations, total
 end
 
 local function parseFfmpegDurations(stdout)
@@ -85,18 +64,17 @@ end
 
 local CACHE_VERSION = 1
 
-local function saveGifMetadata(cacheDir, frames, durations, totalDuration, extractor, sourceMtime, sourceSize)
+local function saveGifMetadata(cacheDir, frames, durations, totalDuration, sourceMtime, sourceSize)
   local meta = {
     frames = frames,
     durations = durations,
     totalDuration = totalDuration,
-    extractor = extractor or "unknown",
     sourceMtime = sourceMtime,
     sourceSize = sourceSize,
     cacheVersion = CACHE_VERSION,
   }
-  local ok, encoded = pcall(noctalia.json.encode, meta)
-  if ok then
+  local encoded = noctalia.json.encode(meta)
+  if encoded ~= nil then
     noctalia.writeFile(cacheDir .. "/metadata.json", encoded)
   end
 end
@@ -106,26 +84,22 @@ local function loadGifMetadata(cacheDir, path)
   if not raw then
     return false
   end
-  local ok, meta = pcall(noctalia.json.decode, raw)
-  if not ok or not meta or not meta.frames then
+  local meta = noctalia.json.decode(raw)
+  if type(meta) ~= "table" or type(meta.frames) ~= "table" then
     return false
   end
 
-  -- Invalidate cache if the source file has changed, or if the cache format
-  -- has been updated (e.g. to fix transparency handling).
-  -- Also invalidate legacy caches that lack source metadata.
-  if meta.cacheVersion ~= CACHE_VERSION then
+  -- Invalidate the cache when the source file changed or the cache format did.
+  if meta.cacheVersion ~= CACHE_VERSION
+    or meta.sourceMtime == nil
+    or meta.sourceSize == nil then
     return false
   end
-  if path then
-    if meta.sourceMtime == nil or meta.sourceSize == nil then
+
+  local info = noctalia.fileInfo(path)
+  if info then
+    if meta.sourceMtime ~= info.mtime or meta.sourceSize ~= info.size then
       return false
-    end
-    local info = noctalia.fileInfo(path)
-    if info then
-      if meta.sourceMtime ~= info.mtime or meta.sourceSize ~= info.size then
-        return false
-      end
     end
   end
 
@@ -138,12 +112,13 @@ local function loadGifMetadata(cacheDir, path)
   return true
 end
 
-local function finalizeFrames(cacheDir, frameCount, startIndex, durations, totalDuration, extractor, sourceMtime, sourceSize)
+local function finalizeFrames(cacheDir, frameCount, durations, totalDuration, sourceMtime, sourceSize)
   local frames = {}
-  for i = 0, frameCount - 1 do
-    table.insert(frames, string.format("frame-%03d.png", startIndex + i))
+  for i = 1, frameCount do
+    local name = string.format("frame-%03d.png", i)
+    table.insert(frames, name)
   end
-  saveGifMetadata(cacheDir, frames, durations, totalDuration, extractor, sourceMtime, sourceSize)
+  saveGifMetadata(cacheDir, frames, durations, totalDuration, sourceMtime, sourceSize)
 
   gifFrames = {}
   for _, name in ipairs(frames) do
@@ -155,64 +130,15 @@ local function finalizeFrames(cacheDir, frameCount, startIndex, durations, total
   gifLoading = false
 end
 
-local function extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
-  -- Read frame durations first; this also tells us how many frames exist.
-  noctalia.runAsync({
-    "magick", "identify", "-format", "%T\n", path
-  }, function(identify)
-    if identify.exitCode ~= 0 then
-      noctalia.log("GIF identify failed: " .. (identify.stderr or ""))
-      gifLoading = false
-      return
-    end
-
-    local durations, totalDuration = parseGifDurations(identify.stdout)
-    local frameCount = #durations
-    if frameCount == 0 then
-      durations = { 100 }
-      totalDuration = 100
-      frameCount = 1
-    end
-
-    -- Check whether the cached frames already match this count.
-    local cached = true
-    for i = 0, frameCount - 1 do
-      local framePath = string.format(cacheDir .. "/frame-%03d.png", i)
-      if not noctalia.fileExists(framePath) then
-        cached = false
-        break
-      end
-    end
-
-    if cached then
-      finalizeFrames(cacheDir, frameCount, 0, durations, totalDuration, "magick", sourceMtime, sourceSize)
-      return
-    end
-
-    -- Extract frames with ImageMagick, resizing to the widget display size.
-    noctalia.runAsync({
-      "magick", path, "-coalesce", "-resize", "320x320>", cacheDir .. "/frame-%03d.png"
-    }, function(result)
-      if result.exitCode ~= 0 then
-        noctalia.log("GIF extraction failed: " .. (result.stderr or ""))
-        gifLoading = false
-        return
-      end
-      finalizeFrames(cacheDir, frameCount, 0, durations, totalDuration, "magick", sourceMtime, sourceSize)
-    end)
-  end)
-end
-
 local function extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
-  -- ffmpeg starts output at frame-001.png; probe duration first.
   noctalia.runAsync({
     "ffprobe", "-v", "error", "-select_streams", "v:0",
     "-show_entries", "frame=pts_time", "-of",
     "csv=p=0", path
   }, function(probe)
     if probe.exitCode ~= 0 then
-      noctalia.log("ffprobe failed: " .. (probe.stderr or ""))
-      extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
+      noctalia.log("audio-sticker: ffprobe failed: " .. (probe.stderr or ""))
+      gifLoading = false
       return
     end
 
@@ -235,11 +161,10 @@ local function extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
     end
 
     if cached then
-      finalizeFrames(cacheDir, frameCount, 1, durations, totalDuration, "ffmpeg", sourceMtime, sourceSize)
+      finalizeFrames(cacheDir, frameCount, durations, totalDuration, sourceMtime, sourceSize)
       return
     end
 
-    -- Extract resized frames with ffmpeg (much faster than ImageMagick).
     noctalia.runAsync({
       "ffmpeg", "-y", "-i", path,
       "-vf", "scale=320:-1:flags=lanczos",
@@ -247,11 +172,11 @@ local function extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
       cacheDir .. "/frame-%03d.png"
     }, function(result)
       if result.exitCode ~= 0 then
-        noctalia.log("ffmpeg extraction failed: " .. (result.stderr or ""))
-        extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
+        noctalia.log("audio-sticker: ffmpeg extraction failed: " .. (result.stderr or ""))
+        gifLoading = false
         return
       end
-      finalizeFrames(cacheDir, frameCount, 1, durations, totalDuration, "ffmpeg", sourceMtime, sourceSize)
+      finalizeFrames(cacheDir, frameCount, durations, totalDuration, sourceMtime, sourceSize)
     end)
   end)
 end
@@ -262,7 +187,17 @@ local function extractGifFrames(path)
     if noctalia.nowMs() - gifLoadStart < 30000 then
       return
     end
-    noctalia.log("GIF extraction timed out, retrying")
+    noctalia.log("audio-sticker: GIF extraction timed out, retrying")
+  end
+
+  if dataDir == "" then
+    noctalia.log("audio-sticker: no plugin data directory, cannot cache GIF frames")
+    return
+  end
+
+  if not noctalia.commandExists("ffmpeg") or not noctalia.commandExists("ffprobe") then
+    noctalia.log("audio-sticker: ffmpeg is required for animated GIFs")
+    return
   end
 
   gifLoading = true
@@ -275,7 +210,7 @@ local function extractGifFrames(path)
   local sourceMtime = sourceInfo and sourceInfo.mtime or 0
   local sourceSize = sourceInfo and sourceInfo.size or 0
 
-  -- Use cached metadata if available and the source file has not changed.
+  -- Use cached metadata if the source file has not changed.
   if loadGifMetadata(cacheDir, path) then
     gifPath = path
     gifStartTime = noctalia.nowMs()
@@ -283,17 +218,7 @@ local function extractGifFrames(path)
     return
   end
 
-  -- ffmpeg is much faster than ImageMagick and preserves transparency on
-  -- correctly-authored transparent GIFs. Fall back to ImageMagick only if
-  -- ffmpeg is unavailable.
-  if noctalia.commandExists("ffmpeg") then
-    extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
-  elseif noctalia.commandExists("magick") then
-    extractWithMagick(path, cacheDir, sourceMtime, sourceSize)
-  else
-    noctalia.log("ffmpeg or ImageMagick is required for GIF support")
-    gifLoading = false
-  end
+  extractWithFfmpeg(path, cacheDir, sourceMtime, sourceSize)
 end
 
 local function currentGifFrame()
@@ -304,8 +229,7 @@ local function currentGifFrame()
     return gifFrames[1]
   end
 
-  local elapsed = noctalia.nowMs() - gifStartTime
-  elapsed = elapsed % gifTotalDuration
+  local elapsed = (noctalia.nowMs() - gifStartTime) % gifTotalDuration
 
   local t = 0
   for i, dur in ipairs(gifDurations) do
@@ -340,7 +264,7 @@ local function renderImage(path)
     -- Still extracting frames.
     desktopWidget.render(
       ui.column({ align = "center", justify = "center" }, {
-        ui.label({ text = "Loading GIF...", color = "on_surface_variant" }),
+        ui.label({ text = noctalia.tr("widget.loading_gif"), color = "on_surface_variant" }),
       })
     )
     return
@@ -358,12 +282,22 @@ local function renderImage(path)
 end
 
 local function render()
+  if status ~= nil and status.state == "error" then
+    desktopWidget.render(
+      ui.column({ align = "center", justify = "center", gap = 8 }, {
+        ui.glyph({ name = "alert-triangle", size = 48, color = "error" }),
+        ui.label({ text = status.message or noctalia.tr("widget.build_failed"), color = "on_surface_variant" }),
+      })
+    )
+    return
+  end
+
   local path = noctalia.getConfig("image_path") or ""
   if path == "" then
     desktopWidget.render(
       ui.column({ align = "center", justify = "center", gap = 8 }, {
         ui.glyph({ name = "photo", size = 48, color = "on_surface_variant" }),
-        ui.label({ text = "Select an image", color = "on_surface_variant" }),
+        ui.label({ text = noctalia.tr("widget.no_image"), color = "on_surface_variant" }),
       })
     )
     return
@@ -382,48 +316,27 @@ local function resetGif()
   gifLoadStart = 0
 end
 
-local function setActive(active)
-  targetOpacity = active
-    and (noctalia.getConfig("active_opacity") or 1.0)
-    or  (noctalia.getConfig("idle_opacity") or 0.0)
-  -- Do NOT reset gifStartTime here; setActive is called on every config
-  -- update and would restart the GIF loop prematurely while audio is active.
-end
-
-local function startMonitor()
-  if not noctalia.fileExists(helperPath) then
-    return
+local function opacityFor(isActive)
+  if isActive then
+    return noctalia.getConfig("active_opacity") or 1.0
   end
-
-  local hysteresis = noctalia.getConfig("hysteresis_ms") or 500
-
-  local cmd = table.concat({
-    "nohup",
-    helperPath,
-    "--hysteresis-ms", tostring(hysteresis),
-    "--state-file", stateFile,
-    ">/dev/null",
-    "2>/dev/null",
-    "&",
-  }, " ")
-
-  noctalia.runAsync({"/usr/bin/bash", "-c", cmd})
+  return noctalia.getConfig("idle_opacity") or 0.0
 end
 
-startMonitor()
+local function setActive(isActive)
+  active = isActive
+  targetOpacity = opacityFor(isActive)
+  -- Restart the GIF loop only when the sticker becomes visible again; config
+  -- updates must not rewind it while audio keeps playing.
+  if isActive and gifPath then
+    gifStartTime = noctalia.nowMs()
+  end
+end
+
+targetOpacity = opacityFor(active)
 
 function update()
   desktopWidget.setNeedsFrameTick(true)
-
-  local active = readState()
-  setActive(active == true)
-  -- Initialise the animation start time only once on first load while audio is active.
-  if active and gifPath and gifStartTime == 0 then
-    gifStartTime = noctalia.nowMs()
-  end
-  currentOpacity = targetOpacity
-  opacity = targetOpacity
-  previousState = active
 
   local path = noctalia.getConfig("image_path") or ""
   if not isGif(path) then
@@ -436,14 +349,11 @@ function update()
 end
 
 function onFrameTick(deltaMs)
-  local active = readState()
-  if active ~= nil and active ~= previousState then
-    previousState = active
-    setActive(active)
-    -- Restart the GIF loop only when transitioning from idle to active.
-    if active and gifPath then
-      gifStartTime = noctalia.nowMs()
-    end
+  -- Follow playback state even when the watch callback landed before this
+  -- widget finished loading.
+  local nowActive = noctalia.state.get(ACTIVE_KEY) == true
+  if nowActive ~= active then
+    setActive(nowActive)
   end
 
   local fadeMs = noctalia.getConfig("fade_ms") or 300
@@ -470,3 +380,17 @@ function onFrameTick(deltaMs)
     render()
   end
 end
+
+noctalia.state.watch(ACTIVE_KEY, function(value)
+  local isActive = value == true
+  if isActive ~= active then
+    setActive(isActive)
+  end
+end)
+
+noctalia.state.watch(STATUS_KEY, function(value)
+  status = value
+  render()
+end)
+
+update()

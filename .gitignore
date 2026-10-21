@@ -1,6 +1,5 @@
 # Build artifacts
-audio-monitor/noctalia-audio-monitor
-bin/noctalia-audio-monitor
+/bin/
 
 # Editor / OS
 *.swp

@@ -1,7 +1,7 @@
 /*
  * noctalia-audio-monitor
  *
- * Monitors PipeWire output streams and reports:
+ * Monitors PipeWire output streams and prints one line on every change:
  *   "active" when any output stream is in the running state
  *   "idle"   when all output streams are idle/suspended/paused
  *
@@ -9,7 +9,11 @@
  * open while paused/idle (e.g. Brave, Spotify in "init" state). We care about
  * streams that are actually playing audio, not just open streams.
  *
- * Usage: noctalia-audio-monitor [--threshold T] [--hysteresis-ms N] [--state-file PATH] [--debug]
+ * The plugin service reads those lines with noctalia.runStream(). A pid file
+ * with an exclusive lock keeps a single monitor per session, so a second copy
+ * exits immediately instead of reporting the same transitions twice.
+ *
+ * Usage: noctalia-audio-monitor [--hysteresis-ms N] [--debug]
  */
 
 #include <pipewire/pipewire.h>
@@ -26,6 +30,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/prctl.h>
 
 #define DEFAULT_HYSTERESIS_MS 500
 #define MAX_STREAMS 32
@@ -53,8 +58,6 @@ struct context {
 
     int hysteresis_ms;
     bool debug;
-    char *state_file;
-    FILE *state_fp;
 
     bool reported_active;
     struct spa_source *timer;
@@ -76,40 +79,22 @@ static char *get_default_pid_file(void)
     return path;
 }
 
-static bool process_is_running(pid_t pid)
-{
-    return kill(pid, 0) == 0;
-}
-
-static bool acquire_pid_file(const char *path)
+static int acquire_pid_file(const char *path)
 {
     int fd = open(path, O_RDWR | O_CREAT, 0644);
     if (fd < 0)
-        return false;
+        return -1;
 
+    /* The descriptor stays open for the process lifetime, so the lock is
+     * released by the kernel when the monitor exits, even on a crash. */
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         close(fd);
-        return false;
-    }
-
-    pid_t existing = 0;
-    char buf[64];
-    ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
-    if (n > 0) {
-        buf[n] = '\0';
-        existing = (pid_t)atoi(buf);
-    }
-
-    if (existing > 0 && existing != getpid() && process_is_running(existing)) {
-        flock(fd, LOCK_UN);
-        close(fd);
-        return false;
+        return -1;
     }
 
     ftruncate(fd, 0);
     dprintf(fd, "%d\n", getpid());
-    (void)fd;
-    return true;
+    return fd;
 }
 
 static void remove_pid_file(void)
@@ -124,13 +109,6 @@ static void report_state(struct context *ctx, bool active, bool force)
         return;
 
     const char *line = active ? "active" : "idle";
-
-    if (ctx->state_fp) {
-        rewind(ctx->state_fp);
-        ftruncate(fileno(ctx->state_fp), 0);
-        fprintf(ctx->state_fp, "%s\n", line);
-        fflush(ctx->state_fp);
-    }
 
     printf("%s\n", line);
     fflush(stdout);
@@ -329,10 +307,9 @@ static void on_signal(int sig)
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [--threshold T] [--hysteresis-ms N] [--state-file PATH] [--debug]\n"
-            "  --threshold T      ignored, kept for compatibility\n"
-            "  --hysteresis-ms N  idle delay in ms, default %d\n"
-            "  --state-file PATH  write state to PATH instead of stdout\n",
+            "Usage: %s [--hysteresis-ms N] [--debug]\n"
+            "  --hysteresis-ms N  delay before reporting idle, in ms, default %d\n"
+            "  --debug            log node state transitions to stderr\n",
             prog, DEFAULT_HYSTERESIS_MS);
 }
 
@@ -342,26 +319,19 @@ int main(int argc, char *argv[])
     g_ctx.hysteresis_ms = DEFAULT_HYSTERESIS_MS;
 
     static struct option long_options[] = {
-        { "threshold",     required_argument, 0, 't' },
         { "hysteresis-ms", required_argument, 0, 'h' },
-        { "state-file",    required_argument, 0, 's' },
         { "debug",         no_argument,       0, 'd' },
         { "help",          no_argument,       0, '?' },
         { 0, 0, 0, 0 }
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "t:h:s:d", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "h:d", long_options, NULL)) != -1) {
         switch (c) {
-        case 't':
-            break;
         case 'h':
             g_ctx.hysteresis_ms = atoi(optarg);
             if (g_ctx.hysteresis_ms < 0)
                 g_ctx.hysteresis_ms = 0;
-            break;
-        case 's':
-            g_ctx.state_file = strdup(optarg);
             break;
         case 'd':
             g_ctx.debug = true;
@@ -373,7 +343,7 @@ int main(int argc, char *argv[])
     }
 
     g_pid_file = get_default_pid_file();
-    if (g_pid_file && !acquire_pid_file(g_pid_file)) {
+    if (g_pid_file && acquire_pid_file(g_pid_file) < 0) {
         if (g_ctx.debug)
             fprintf(stderr, "[audio-monitor] another instance is already running\n");
         free(g_pid_file);
@@ -381,10 +351,14 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    if (g_ctx.state_file) {
-        g_ctx.state_fp = fopen(g_ctx.state_file, "w");
-        if (!g_ctx.state_fp && g_ctx.debug)
-            fprintf(stderr, "[audio-monitor] failed to open state file %s\n", g_ctx.state_file);
+    /* The service runs this monitor from a small shell loop. When that shell
+     * goes away (plugin reload, shell restart) the kernel sends us SIGTERM, so
+     * no orphan keeps holding the pid lock. */
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (getppid() == 1) {
+        remove_pid_file();
+        free(g_pid_file);
+        return 0;
     }
 
     pw_init(&argc, &argv);
@@ -432,9 +406,6 @@ int main(int argc, char *argv[])
     pw_main_loop_destroy(g_ctx.loop);
     pw_deinit();
 
-    if (g_ctx.state_fp)
-        fclose(g_ctx.state_fp);
-    free(g_ctx.state_file);
     remove_pid_file();
     free(g_pid_file);
 

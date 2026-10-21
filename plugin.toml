@@ -1,16 +1,34 @@
+# Audio Reactive Sticker - a desktop sticker that fades with audio playback.
+#
+#   sticker  [[desktop_widget]]  draws the image and fades it
+#   monitor  [[service]]         builds bin/noctalia-audio-monitor from
+#                                native/ on first run, keeps one copy alive and
+#                                republishes its output as plugin state
+#
+# The service owns the PipeWire helper, so several sticker instances share one
+# process. The helper is compiled locally: this plugin ships C source, not a
+# prebuilt binary.
+
 id           = "miixz/audio-sticker"
 name         = "Audio Reactive Sticker"
 version      = "1.0.0"
-plugin_api   = 32
+plugin_api   = 24
 author       = "miixz"
 license      = "MIT"
+icon         = "photo"
 description  = "Desktop sticker that fades in and out with audio playback."
-tags         = ["audio", "desktop", "widget", "sticker"]
+tags         = ["desktop", "audio", "animation"]
+dependencies = ["cc", "make", "pkg-config", "libpipewire-0.3", "ffmpeg"]
 
 [[desktop_widget]]
 id    = "sticker"
 entry = "widget.luau"
 
+[[service]]
+id    = "monitor"
+entry = "service.luau"
+
+# Read when the helper starts; changes apply on the next plugin reload.
 [[setting]]
 key             = "hysteresis_ms"
 type            = "int"
@@ -37,6 +55,7 @@ description_key = "settings.active_opacity.description"
 default         = 1.0
 min             = 0.0
 max             = 1.0
+step            = 0.05
 
 [[desktop_widget.setting]]
 key             = "idle_opacity"
@@ -46,6 +65,7 @@ description_key = "settings.idle_opacity.description"
 default         = 0.0
 min             = 0.0
 max             = 1.0
+step            = 0.05
 
 [[desktop_widget.setting]]
 key             = "fade_ms"

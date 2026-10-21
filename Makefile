@@ -1,21 +1,17 @@
-.PHONY: all audio-monitor install clean
+.PHONY: all install clean
 
 PREFIX ?= $(HOME)/.local/share/noctalia/plugins
 PLUGIN_DIR = $(PREFIX)/audio-sticker
 
-all: audio-monitor
+all:
+	$(MAKE) -C native
 
-audio-monitor:
-	$(MAKE) -C audio-monitor
-	mkdir -p bin
-	cp audio-monitor/noctalia-audio-monitor bin/
-
-install: audio-monitor
+install: all
 	mkdir -p $(PLUGIN_DIR)
-	rsync -av --exclude='.git' --exclude='audio-monitor/noctalia-audio-monitor' \
-		plugin.toml widget.luau translations bin audio-monitor README.md LICENSE \
+	rsync -a --exclude='.*' \
+		plugin.toml service.luau widget.luau translations native bin \
+		README.md LICENSE thumbnail.webp \
 		$(PLUGIN_DIR)/
 
 clean:
-	$(MAKE) -C audio-monitor clean
-	rm -f bin/noctalia-audio-monitor
+	$(MAKE) -C native clean
