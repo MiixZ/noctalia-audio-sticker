@@ -211,7 +211,7 @@ jobs:
             --json number,headRefName,headRepositoryOwner \
             --jq '.[] | "\(.number) \(.headRefName) \((.headRepositoryOwner // {}).login)"' \
             | awk -v owner="${FORK_OWNER}" -v branch="${BRANCH}" \
-              '$2 == branch && $3 == owner { print $1; exit }')"
+              '$2 == branch && $3 == owner { if (!found) { print $1; found = 1 } }')"
           if [ -n "${pr_number}" ]; then
             echo "::notice::Updated the existing pull request #${pr_number}."
           else
