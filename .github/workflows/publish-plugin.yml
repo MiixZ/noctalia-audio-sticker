@@ -82,13 +82,13 @@ jobs:
           echo "Publishing ${PLUGIN_ID} v${version}"
 
       - name: Check out the community repository
-        run: git clone --depth=1 "https://github.com/${UPSTREAM_REPO}.git" upstream
+        run: git clone --depth=1 "https://github.com/${UPSTREAM_REPO}.git" "${RUNNER_TEMP}/community"
 
       - name: Detect whether this is a new plugin or an update
         id: kind
         run: |
           set -euo pipefail
-          if git -C upstream cat-file -e "HEAD:${PLUGIN_DIR}/plugin.toml" 2>/dev/null; then
+          if git -C "${RUNNER_TEMP}/community" cat-file -e "HEAD:${PLUGIN_DIR}/plugin.toml" 2>/dev/null; then
             echo "action=update" >> "${GITHUB_OUTPUT}"
           else
             echo "action=add" >> "${GITHUB_OUTPUT}"
@@ -120,13 +120,14 @@ jobs:
           set -euo pipefail
           python3 .github/scripts/check-pr-body.py \
             "${RUNNER_TEMP}/pr-body.md" \
-            upstream/.github/workflows/scripts/enforce-pr-template.py
+            "${RUNNER_TEMP}/community/.github/workflows/scripts/enforce-pr-template.py"
 
       - name: Stage the plugin directory
         run: |
           set -euo pipefail
-          rm -rf "upstream/${PLUGIN_DIR}"
-          mkdir -p "upstream/${PLUGIN_DIR}"
+          target="${RUNNER_TEMP}/community/${PLUGIN_DIR}"
+          rm -rf "${target}"
+          mkdir -p "${target}"
           rsync -a \
             --exclude='.git' \
             --exclude='.github' \
@@ -134,20 +135,20 @@ jobs:
             --exclude='/LICENSE' \
             --exclude='/bin/' \
             --exclude='/src/' \
-            ./ "upstream/${PLUGIN_DIR}/"
+            ./ "${target}/"
 
       - name: Validate the community manifest
         run: |
           set -euo pipefail
-          cd upstream
+          cd "${RUNNER_TEMP}/community"
           python3 .github/workflows/scripts/validate-plugins.py
 
       - name: Show what would be published
         run: |
           set -euo pipefail
-          git -C upstream add -- "${PLUGIN_DIR}"
-          git -C upstream diff --cached --stat
-          if git -C upstream diff --cached --quiet; then
+          git -C "${RUNNER_TEMP}/community" add -- "${PLUGIN_DIR}"
+          git -C "${RUNNER_TEMP}/community" diff --cached --stat
+          if git -C "${RUNNER_TEMP}/community" diff --cached --quiet; then
             echo "No changes against upstream main."
           fi
 
@@ -193,18 +194,18 @@ jobs:
             title="feat(${PLUGIN_DIR}): add audio reactive sticker plugin"
           fi
 
-          git -C upstream config user.name "github-actions[bot]"
-          git -C upstream config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C upstream switch -c "${BRANCH}"
+          git -C "${RUNNER_TEMP}/community" config user.name "github-actions[bot]"
+          git -C "${RUNNER_TEMP}/community" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "${RUNNER_TEMP}/community" switch -c "${BRANCH}"
 
-          if git -C upstream diff --cached --quiet; then
+          if git -C "${RUNNER_TEMP}/community" diff --cached --quiet; then
             echo "::notice::The plugin is identical to upstream main; no pull request is needed."
             exit 0
           fi
 
-          git -C upstream commit -m "${title}"
+          git -C "${RUNNER_TEMP}/community" commit -m "${title}"
           gh auth setup-git
-          git -C upstream push --force "https://github.com/${FORK_REPO}.git" "HEAD:refs/heads/${BRANCH}"
+          git -C "${RUNNER_TEMP}/community" push --force "https://github.com/${FORK_REPO}.git" "HEAD:refs/heads/${BRANCH}"
 
           pr_number="$(gh pr list --repo "${UPSTREAM_REPO}" --head "${FORK_OWNER}:${BRANCH}" --state open --json number --jq '.[0].number // empty')"
           if [ -n "${pr_number}" ]; then
