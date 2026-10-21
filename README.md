@@ -89,12 +89,14 @@ rotation = 0.0
 ## Build
 
 ```bash
-make
+make -C native
 ```
 
-Compiles `native/audio-monitor.c` into `bin/noctalia-audio-monitor`. You do not
-need to run this by hand: the plugin service builds the helper the first time
-the plugin is enabled, and shows an alert if the build fails.
+Compiles `native/audio-monitor.c` into `bin/noctalia-audio-monitor`. Run it from
+the plugin directory, or from the repository root; the published plugin ships
+`native/Makefile`, not a top-level one. You do not need to run this by hand: the
+plugin service builds the helper the first time the plugin is enabled, and
+shows an alert if the build fails.
 
 ## Development
 
